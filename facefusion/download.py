@@ -3,9 +3,11 @@ import shutil
 import ssl
 import subprocess
 import urllib.request
+import requests
 from functools import lru_cache
 from typing import List, Tuple
 from urllib.parse import urlparse
+import hashlib
 
 from tqdm import tqdm
 
@@ -19,7 +21,7 @@ if is_macos():
 	ssl._create_default_https_context = ssl._create_unverified_context
 
 
-def conditional_download(download_directory_path : str, urls : List[str]) -> None:
+def conditional_download(download_directory_path: str, urls: List[str], max_retries: int = 3) -> None:
 	for url in urls:
 		download_file_name = os.path.basename(urlparse(url).path)
 		download_file_path = os.path.join(download_directory_path, download_file_name)
@@ -27,15 +29,32 @@ def conditional_download(download_directory_path : str, urls : List[str]) -> Non
 		download_size = get_download_size(url)
 
 		if initial_size < download_size:
-			with tqdm(total = download_size, initial = initial_size, desc = wording.get('downloading'), unit = 'B', unit_scale = True, unit_divisor = 1024, ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
-				subprocess.Popen([ shutil.which('curl'), '--create-dirs', '--silent', '--insecure', '--location', '--continue-at', '-', '--output', download_file_path, url ])
-				current_size = initial_size
+			for attempt in range(max_retries):
+				try:
+					with requests.get(url, stream=True) as response:
+						response.raise_for_status()
+						total_size = int(response.headers.get('content-length', 0))
 
-				progress.set_postfix(file = download_file_name)
-				while current_size < download_size:
-					if is_file(download_file_path):
-						current_size = get_file_size(download_file_path)
-						progress.update(current_size - progress.n)
+						with open(download_file_path, 'wb') as file, tqdm(
+							desc=wording.get('downloading'),
+							total=total_size,
+							unit='iB',
+							unit_scale=True,
+							unit_divisor=1024,
+						) as progress_bar:
+							for data in response.iter_content(chunk_size=8192):
+								size = file.write(data)
+								progress_bar.update(size)
+
+					# Verify checksum here if available
+
+					break  # Successful download, exit retry loop
+				except requests.RequestException as e:
+					logger.error(f"Download failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+					if attempt == max_retries - 1:
+						logger.error(f"Failed to download {url} after {max_retries} attempts.")
+						return False
+	return True
 
 
 @lru_cache(maxsize = None)

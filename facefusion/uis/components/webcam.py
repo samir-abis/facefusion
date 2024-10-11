@@ -3,7 +3,7 @@ import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Deque, Generator, Optional
-
+import time
 import cv2
 import gradio
 from tqdm import tqdm
@@ -94,7 +94,13 @@ def start(webcam_mode : WebcamMode, webcam_resolution : str, webcam_fps : Fps) -
 		webcam_capture.set(cv2.CAP_PROP_FRAME_WIDTH, webcam_width)
 		webcam_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, webcam_height)
 		webcam_capture.set(cv2.CAP_PROP_FPS, webcam_fps)
+		frame_time = 1.0 / webcam_fps
+		last_time = time.time()
 		for capture_frame in multi_process_capture(source_face, webcam_capture, webcam_fps):
+			current_time = time.time()
+			if current_time - last_time < frame_time:
+				time.sleep(frame_time - (current_time - last_time))
+			last_time = time.time()
 			if webcam_mode == 'inline':
 				yield normalize_frame_color(capture_frame)
 			else:
@@ -106,31 +112,32 @@ def start(webcam_mode : WebcamMode, webcam_resolution : str, webcam_fps : Fps) -
 
 
 def multi_process_capture(source_face : Face, webcam_capture : cv2.VideoCapture, webcam_fps : Fps) -> Generator[VisionFrame, None, None]:
-	deque_capture_frames: Deque[VisionFrame] = deque()
-	with tqdm(desc = wording.get('processing'), unit = 'frame', ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
-		progress.set_postfix(
-		{
-			'execution_providers': state_manager.get_item('execution_providers'),
-			'execution_thread_count': state_manager.get_item('execution_thread_count')
-		})
-		with ThreadPoolExecutor(max_workers = state_manager.get_item('execution_thread_count')) as executor:
-			futures = []
+	max_queue_size = 3
+	deque_capture_frames: Deque[VisionFrame] = deque(maxlen=max_queue_size)
+	with ThreadPoolExecutor(max_workers=state_manager.get_item('execution_thread_count')) as executor:
+		futures = []
 
-			while webcam_capture and webcam_capture.isOpened():
-				_, capture_frame = webcam_capture.read()
-				if analyse_stream(capture_frame, webcam_fps):
-					return
+		while webcam_capture and webcam_capture.isOpened():
+			_, capture_frame = webcam_capture.read()
+			if analyse_stream(capture_frame, webcam_fps):
+				return
+
+			if len(futures) < max_queue_size:
 				future = executor.submit(process_stream_frame, source_face, capture_frame)
 				futures.append(future)
 
-				for future_done in [ future for future in futures if future.done() ]:
-					capture_frame = future_done.result()
+			for future in list(futures):
+				if future.done():
+					capture_frame = future.result()
 					deque_capture_frames.append(capture_frame)
-					futures.remove(future_done)
+					futures.remove(future)
 
-				while deque_capture_frames:
-					progress.update()
-					yield deque_capture_frames.popleft()
+			while deque_capture_frames:
+				yield deque_capture_frames.popleft()
+
+			# Skip frames if we're falling behind
+			if len(futures) == max_queue_size:
+				_, _ = webcam_capture.read()  # Skip a frame
 
 
 def stop() -> gradio.Image:
